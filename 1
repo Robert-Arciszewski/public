@@ -1,0 +1,169 @@
+# kibana_login_playwright.py
+# Playwright sync script: logowanie do Kibana (flow: login -> Proceed -> sandbox code -> password)
+# Uwaga: dostosuj SELECTORY jeśli twoje UI ma customowe pola.
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+import json, time, re, sys
+
+KIBANA = "https://kibana.pl"  # <- Twoja strona
+USERNAME = "x"
+PASSWORD = "x"
+HEADLESS = True   # False -> zobaczysz przeglądarkę
+
+# selektory (dostosuj gdy trzeba)
+sel_username = 'input[name="username"], input#username, input[type="text"]'
+sel_proceed_btn = 'button:has-text("Proceed"), button:has-text("Continue"), button:has-text("Next")'
+sel_code_on_page = 'text=/sandbox|code|sandbox code/i'  # fallback: szuka tekstu
+sel_password = 'input[name="password"], input#password, input[type="password"]'
+sel_signin_btn = 'button:has-text("Sign in"), button:has-text("Log in"), button[type="submit"]'
+
+def save_cookies(context, path="cookies.json"):
+    cookies = context.cookies()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cookies, f, indent=2)
+    print(f"[+] Cookies saved to {path}")
+
+def dump_storage(page):
+    # próbuje pobrać localStorage i sessionStorage
+    try:
+        ls = page.evaluate("() => Object.assign({}, window.localStorage)")
+        ss = page.evaluate("() => Object.assign({}, window.sessionStorage)")
+        return ls, ss
+    except Exception as e:
+        print("! storage read error:", e)
+        return {}, {}
+
+def extract_sandbox_from_url(url):
+    # szuka /s/<sandbox>/ lub ?sandbox=XYZ lub &sandbox=XYZ
+    m = re.search(r"/s/([a-zA-Z0-9_\-]+)/", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]sandbox=([a-zA-Z0-9_\-]+)", url)
+    if m:
+        return m.group(1)
+    return None
+
+def try_find_text_code(page):
+    # próbuje znaleźć widoczny kod/sandbox na stronie - zwraca tekst jeśli znajdzie
+    try:
+        el = page.query_selector(sel_code_on_page)
+        if el:
+            txt = el.text_content().strip()
+            # krótka normalizacja
+            found = re.search(r"([A-Za-z0-9_\-]{4,40})", txt)
+            return found.group(1) if found else txt
+    except Exception:
+        pass
+    return None
+
+def main():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=HEADLESS)
+        context = browser.new_context()
+        page = context.new_page()
+
+        try:
+            print("[*] Go to kibana login")
+            page.goto(f"{KIBANA}/login", wait_until="domcontentloaded", timeout=15000)
+            time.sleep(0.5)
+
+            # 1) wpisz username jeśli pole jest obecne
+            try:
+                el = page.wait_for_selector(sel_username, timeout=4000)
+                print("[*] Found username field — filling")
+                el.fill(USERNAME)
+                # klik Proceed/Next
+                btn = page.query_selector(sel_proceed_btn)
+                if btn:
+                    print("[*] Clicking proceed button")
+                    btn.click()
+                else:
+                    print("[*] No proceed button found — maybe single-step flow")
+            except PWTimeout:
+                print("[*] No username field found quickly — maybe already on sandbox/password page or SSO")
+
+            # 2) chwilowe oczekiwanie na redirect / pojawienie się kodu
+            time.sleep(1.0)
+            current_url = page.url
+            print("[*] Current URL:", current_url)
+
+            # 3) próbuj wyciągnąć sandbox z URL
+            sandbox = extract_sandbox_from_url(current_url)
+            if sandbox:
+                print("[+] Sandbox found in URL:", sandbox)
+            else:
+                # spróbuj znaleźć kod na stronie (tekst)
+                found = try_find_text_code(page)
+                if found:
+                    print("[+] Sandbox/code found on page text:", found)
+                    sandbox = found
+                else:
+                    print("[*] Nie znaleziono sandbox w URL ani na stronie. Będziemy kontynuować i czekać na pole password.")
+
+            # 4) poczekaj na pole password i wypełnij
+            try:
+                pw = page.wait_for_selector(sel_password, timeout=8000)
+                print("[*] Password field detected — filling password")
+                pw.fill(PASSWORD)
+                # kliknij sign in
+                btn = page.query_selector(sel_signin_btn) or page.query_selector('button[type="submit"]')
+                if btn:
+                    btn.click()
+                else:
+                    page.keyboard.press("Enter")
+            except PWTimeout:
+                print("[!] Nie wykryto pola password — być może przepływ wymaga ręcznej interakcji lub jest SSO/MFA.")
+
+            # 5) poczekaj na przekierowanie do space lub innego URL
+            try:
+                page.wait_for_url("**/s/*", timeout=10000)
+                print("[+] Przekierowano do space:", page.url)
+                if not sandbox:
+                    sb = extract_sandbox_from_url(page.url)
+                    if sb:
+                        sandbox = sb
+                        print("[+] Odczytano sandbox z URL po logowaniu:", sandbox)
+            except PWTimeout:
+                print("[*] Nie zauważono redirectu do /s/* w limitie. Aktualny URL:", page.url)
+
+            time.sleep(1.5)
+
+            # 6) Zapis cookies i dump storage
+            save_cookies(context, "cookies.json")
+            cookies = {c['name']: c['value'] for c in context.cookies()}
+            print("[*] Session cookies:", cookies)
+            if 'sid' in cookies:
+                print("[+] Found sid cookie:", cookies['sid'])
+            else:
+                print("[!] Nie znaleziono cookie 'sid' — może sesja jest trzymana gdzie indziej (localStorage/sessionStorage)")
+
+            ls, ss = dump_storage(page)
+            print("[*] localStorage keys:", list(ls.keys())[:30])
+            print("[*] sessionStorage keys:", list(ss.keys())[:30])
+            # próbujemy wypisać typowe tokeny
+            for key in ("access_token","accessToken","kbn-token","kbnAccessToken","oidcIdToken"):
+                if key in ls:
+                    print(f"[+] Found {key} in localStorage (truncated): {str(ls[key])[:200]}")
+                if key in ss:
+                    print(f"[+] Found {key} in sessionStorage (truncated): {str(ss[key])[:200]}")
+
+            # 7) dodatkowo spróbuj wykonać fetch do /s/<sandbox>/api/status w kontekście strony (użyje ciastek)
+            if not sandbox:
+                print("[*] Brak sandbox id - spróbuję założyć domyślny 'sandbox' w URL (może być inny)")
+                sandbox = "sandbox"
+            try:
+                status_url = f"{KIBANA}/s/{sandbox}/api/status"
+                print("[*] Trying fetch to", status_url)
+                js = f"""() => fetch("{status_url}", {{credentials:'include'}}).then(r=>r.text())"""
+                txt = page.evaluate(js)
+                print("[*] api/status response head:", txt[:800].replace("\n"," "))
+            except Exception as e:
+                print("! fetch status failed (maybe unauthorized or wrong sandbox):", e)
+
+            print("[+] Done. Jeśli chcesz, użyj cookies.json w requests by robić dalsze wywołania.")
+        except Exception as e:
+            print("FATAL ERROR:", e)
+        finally:
+            browser.close()
+
+if __name__ == "__main__":
+    main()
