@@ -1,0 +1,9 @@
+# 1) raz „ręcznie” zaloguj się Playwrightem do portalu (headful), zapisz storage_state
+context.storage_state(path="state.json")
+
+# 2) potem: wczytaj state i użyj Playwright request API (bez UI):
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    req = p.request.new_context(storage_state="state.json", base_url="https://kibana.pl")
+    resp = req.post("/internal/search/es", headers={"kbn-xsrf":"true","kbn-version":"8.13.4"}, data=payload_json)
+    print(resp.status(), resp.text())
