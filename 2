@@ -1,0 +1,33 @@
+import requests, json
+
+cookies = {
+    "AUTH_SESSION_ID": "z cookies"  # z cookies.json
+}
+
+payload = {
+    "params": {
+        "index": "642fc25d-5c0f-4c0f-a7c9-9d56e4e9ca1f",
+        "body": {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"query_string": {"query": "27917aaf-f94a-47cc-875c-46125196595f"}}
+                    ]
+                }
+            },
+            "sort": [{"@timestamp": {"order": "desc"}}],
+            "size": 10
+        }
+    }
+}
+
+r = requests.post(
+    "https://kibana.pl/internal/search/es",
+    cookies=cookies,
+    headers={"kbn-xsrf": "true"},
+    json=payload,
+    verify=False,
+)
+
+print(r.status_code)
+print(json.dumps(r.json(), indent=2))
