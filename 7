@@ -1,0 +1,87 @@
+import json
+import sys
+import requests
+
+BASE = "https://kibana.pl"
+ENDPOINT = "/internal/search?compress=true"   # z Twojego cURL-a
+KBN_VERSION = "8.13.4"                        # dopasuj do /api/status, jeśli inna
+
+COOKIES_PATH = "cookies.json"                 # plik, który już zapisujesz
+PAYLOAD_PATH = "payload.json"                 # wklej tu data-raw z cURL (jako JSON)
+
+def load_cookies(path: str) -> requests.cookies.RequestsCookieJar:
+    jar = requests.cookies.RequestsCookieJar()
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    # obsłuż dwie możliwe formy: lista ciastek (Playwright) lub mapka {name: value}
+    if isinstance(data, list):
+        for c in data:
+            jar.set(
+                c["name"],
+                c["value"],
+                domain=c.get("domain"),
+                path=c.get("path", "/"),
+            )
+    elif isinstance(data, dict):
+        for k, v in data.items():
+            jar.set(k, v)
+    else:
+        raise ValueError("Nieznany format cookies.json")
+    return jar
+
+def main():
+    # 1) payload
+    try:
+        with open(PAYLOAD_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as e:
+        print(f"[FATAL] Nie mogę wczytać {PAYLOAD_PATH}: {e}")
+        sys.exit(2)
+
+    # 2) cookies
+    try:
+        jar = load_cookies(COOKIES_PATH)
+    except Exception as e:
+        print(f"[FATAL] Nie mogę wczytać {COOKIES_PATH}: {e}")
+        sys.exit(2)
+
+    # 3) nagłówki (minimalny zestaw + UA)
+    headers = {
+        "kbn-xsrf": "true",
+        "kbn-version": KBN_VERSION,
+        "content-type": "application/json",
+        "user-agent": "Mozilla/5.0",
+        # Jeśli chcesz 1:1 jak w cURL, możesz dodać:
+        # "origin": f"{BASE}",
+        # "referer": f"{BASE}/app/discover",
+    }
+
+    s = requests.Session()
+    s.headers.update(headers)
+    s.cookies = jar
+
+    url = f"{BASE}{ENDPOINT}"
+    try:
+        resp = s.post(url, data=json.dumps(payload), timeout=30, verify=False)  # verify=False jeśli korpo cert
+    except requests.RequestException as e:
+        print(f"[FATAL] Request error: {e}")
+        sys.exit(2)
+
+    print(f"[+] STATUS: {resp.status_code}")
+    if resp.is_redirect:
+        print("[!] Redirect →", resp.headers.get("Location"))
+
+    # 4) zapis wyniku
+    try:
+        data = resp.json()
+    except ValueError:
+        print("[!] Odpowiedź nie jest JSON-em, pierwsze 500 znaków:")
+        print(resp.text[:500])
+        sys.exit(1)
+
+    with open("api_results.json", "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    print("[+] Zapisane do api_results.json")
+
+if __name__ == "__main__":
+    main()
