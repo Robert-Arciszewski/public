@@ -1,0 +1,39 @@
+import json
+from playwright.sync_api import sync_playwright
+
+BASE_URL = "https://kibana.pl"
+KBN_VERSION = "8.13.4"
+
+payload = {
+    "params": {
+        "index": "642fc25d-5c0f-4c0f-a7c9-9d56e4e9ca1f",
+        "body": {
+            "query": {
+                "query_string": {"query": "27917aaf-f94a-47cc-875c-46125196595f"}
+            },
+            "sort": [{"@timestamp": {"order": "desc"}}],
+            "size": 10
+        }
+    }
+}
+
+with sync_playwright() as p:
+    # Utworzenie kontekstu z pliku state.json
+    request_context = p.request.new_context(
+        base_url=BASE_URL,
+        storage_state="state.json"
+    )
+
+    # Użyj data= zamiast json=
+    response = request_context.post(
+        "/internal/search/es",
+        headers={
+            "kbn-xsrf": "true",
+            "kbn-version": KBN_VERSION,
+            "content-type": "application/json",
+        },
+        data=json.dumps(payload).encode("utf-8")  # <---- kluczowa linia
+    )
+
+    print(f"[+] STATUS: {response.status()}")
+    print(response.text()[:500])
