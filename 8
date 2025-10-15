@@ -1,0 +1,18 @@
+import requests
+import gzip
+import json
+
+url = 'http://url:5601/internal/bsearch?compress=true'
+headers = {
+    'Content-Type': 'application/json',
+    'kbn-xsrf': 'true',
+    'Authorization': 'Basic <base64 encoded username:password>'
+}
+
+response = requests.post(url, headers=headers, data=your_data)
+
+# decode the response using gzip
+decoded_content = gzip.decompress(response.content)
+
+# convert the decoded content to JSON string
+json_string = json.loads(decoded_content)
