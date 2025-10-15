@@ -1,0 +1,46 @@
+from playwright.sync_api import sync_playwright
+import json
+
+BASE_URL = "https://kibana.pl"
+KBN_VERSION = "8.13.4"   # <-- wpisz swoją wersję Kibany (sprawdzisz w /api/status)
+DATA_VIEW_ID = "642fc25d-5c0f-4c0f-a7c9-9d56e4e9ca1f"
+QUERY_ID = "27917aaf-f94a-47cc-875c-46125196595f"
+
+payload = {
+    "params": {
+        "index": DATA_VIEW_ID,
+        "body": {
+            "query": {
+                "query_string": {"query": QUERY_ID}
+            },
+            "sort": [{"@timestamp": {"order": "desc"}}],
+            "size": 10
+        }
+    }
+}
+
+with sync_playwright() as p:
+    # Tworzy kontekst z zapisanym stanem sesji (bez UI)
+    request_context = p.request.new_context(
+        base_url=BASE_URL,
+        storage_state="state.json"   # <- ten plik z Twojego skryptu logowania
+    )
+
+    response = request_context.post(
+        "/internal/search/es",
+        headers={
+            "kbn-xsrf": "true",
+            "kbn-version": KBN_VERSION,
+            "content-type": "application/json",
+        },
+        data=json.dumps(payload)
+    )
+
+    print(f"[+] STATUS: {response.status()}")
+    if response.ok:
+        data = response.json()
+        with open("out.json", "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        print("[+] Wynik zapisany do out.json")
+    else:
+        print("[!] Błąd:", response.text())
