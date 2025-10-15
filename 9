@@ -1,0 +1,77 @@
+import json, gzip, requests
+
+BASE = "https://kibana.pl"
+ENDPOINTS = [
+    "/internal/bsearch?compress=true",          # najczęściej w 8.x
+    "/internal/search?compress=true",           # alternatywa
+    "/internal/search/es"                       # starsze / inne konfiguracje
+]
+KBN_VERSION = "8.13.4"  # dopasuj do /api/status
+
+def load_cookies(path="cookies.json"):
+    jar = requests.cookies.RequestsCookieJar()
+    data = json.load(open(path, "r", encoding="utf-8"))
+    if isinstance(data, list):
+        for c in data:
+            jar.set(c["name"], c["value"], domain=c.get("domain"), path=c.get("path","/"))
+    elif isinstance(data, dict):
+        for k, v in data.items(): jar.set(k, v)
+    return jar
+
+def try_call(endpoint, payload, jar):
+    headers = {
+        "kbn-xsrf": "true",
+        "kbn-version": KBN_VERSION,
+        "content-type": "application/json",
+        "user-agent": "Mozilla/5.0",
+        "accept-encoding": "gzip, deflate, br",
+        "origin": BASE,
+        "referer": f"{BASE}/app/discover"
+    }
+    r = requests.post(f"{BASE}{endpoint}", headers=headers,
+                      cookies=jar, data=json.dumps(payload), verify=False)
+    return r
+
+def decode_response(r):
+    # jeśli Kibana faktycznie spakowała odpowiedź
+    if r.headers.get("Content-Encoding") == "gzip":
+        return json.loads(gzip.decompress(r.content))
+    # requests i tak zwykle rozpakowuje – fallback:
+    return r.json()
+
+def main():
+    payload = json.load(open("payload.json", "r", encoding="utf-8"))
+    jar = load_cookies("cookies.json")
+
+    last = None
+    for ep in ENDPOINTS:
+        r = try_call(ep, payload, jar)
+        print(f"{ep} -> {r.status_code}")
+        last = r
+        if r.status_code == 200:
+            data = decode_response(r)
+            # spróbuj dotrzeć od razu do hitów
+            hits = (
+                data.get("rawResponse", {})
+                    .get("hits", {})
+                    .get("hits")
+                or
+                (data.get("responses",[{}])[0]
+                    .get("rawResponse",{})
+                    .get("hits",{})
+                    .get("hits"))
+            )
+            # zapisz pełną odpowiedź i „piękne” hity
+            with open("api_results.json","w",encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            with open("hits.json","w",encoding="utf-8") as f:
+                json.dump(hits, f, indent=2, ensure_ascii=False)
+            print("✅ Zapisane: api_results.json (całość), hits.json (same rekordy).")
+            return
+
+    # żaden endpoint nie oddał 200 – pokaż podpowiedź
+    print("❌ Brak 200. Ostatnia odpowiedź:")
+    print(last.status_code, last.headers.get("Content-Type"), last.text[:600])
+
+if __name__ == "__main__":
+    main()
