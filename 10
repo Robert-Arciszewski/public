@@ -1,0 +1,216 @@
+import os
+import sys
+import json
+import gzip
+import brotli
+import subprocess
+import requests
+import urllib3
+from typing import Dict, Any, Optional
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# -------------------- KONFIG --------------------
+
+# 1) URL do Kibany (podmień na swój; flaga compress możesz zmienić na True/False)
+KIBANA_URL = os.environ.get(
+    "KIBANA_URL",
+    "https://twoja-kibana.example.com/internal/bsearch?compress=true",
+)
+
+# 2) Ścieżki
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR))  # repo/kibana jeśli chcesz
+
+COOKIES_PATH = os.environ.get("COOKIES_PATH", os.path.join(BASE_DIR, "cookies.json"))
+GET_COOKIE_SCRIPT = os.environ.get(
+    "GET_COOKIE_SCRIPT", os.path.join(BASE_DIR, "kibana_get_cookie.py")
+)
+
+# 3) Nazwy plików wej/wyj wewnątrz logs/<test_number>/
+PAYLOAD_FILENAME = os.environ.get("PAYLOAD_FILENAME", "payload.json")
+OUTPUT_JSON_FILENAME = "response.json"
+OUTPUT_RAW_FILENAME = "response_raw.txt"
+
+# 4) Wymagane klucze z cookies.json
+COOKIE_KEYS_REQUIRED = ["AUTH0_SESSION_ID", "access_token"]
+
+# 5) Nagłówki – wystarczająco „przeglądarkowe”, ale bez zbędnych śmieci
+DEFAULT_HEADERS = {
+    "accept": "*/*",
+    "accept-language": "pl,en;q=0.9",
+    "content-type": "application/json",
+    "kbn-xsrf": "true",
+    "origin": "https://twoja-kibana.example.com",
+    "referer": "https://twoja-kibana.example.com/app/discover",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+}
+
+# -------------------- POMOCNICZE --------------------
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"❌ {msg}")
+    sys.exit(code)
+
+
+def load_json(path: str) -> Any:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def dump_pretty_json(path: str, obj: Any) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def load_cookies() -> Optional[Dict[str, str]]:
+    """Ładuje cookies z COOKIES_PATH i zwraca dict pod requests.cookies"""
+    try:
+        cookies_list = load_json(COOKIES_PATH)
+    except Exception as e:
+        print(f"⚠️  Nie udało się wczytać {COOKIES_PATH}: {e}")
+        return None
+
+    # Obsłuż dwa typy formatów: lista obiektów z 'name'/'value' albo zwykły dict
+    cookies: Dict[str, str] = {}
+    if isinstance(cookies_list, list):
+        for c in cookies_list:
+            name = c.get("name")
+            value = c.get("value")
+            if name and value:
+                cookies[name] = value
+    elif isinstance(cookies_list, dict):
+        cookies = {k: str(v) for k, v in cookies_list.items()}
+
+    return cookies or None
+
+
+def have_required_cookies(cookies: Dict[str, str]) -> bool:
+    return all(k in cookies and cookies[k] for k in COOKIE_KEYS_REQUIRED)
+
+
+def maybe_get_cookies_via_helper() -> Dict[str, str]:
+    """
+    Jeśli cookies brakuje – uruchom skrypt pomocniczy.
+    Po jego zakończeniu spróbuj ponownie wczytać cookies.
+    """
+    print("ℹ️  Brakuje wymaganych ciastek – odpalam pomocniczy skrypt, aby je pobrać…")
+    try:
+        subprocess.run([sys.executable, GET_COOKIE_SCRIPT], check=True)
+    except FileNotFoundError:
+        die(f"Brak skryptu pomocniczego: {GET_COOKIE_SCRIPT}")
+    except subprocess.CalledProcessError as e:
+        die(f"Skrypt pomocniczy zakończył się błędem: {e}")
+
+    cookies = load_cookies()
+    if not cookies or not have_required_cookies(cookies):
+        die("Nadal brakuje wymaganych ciastek po uruchomieniu skryptu pomocniczego.")
+    print("✅ Używam świeżo pobranych ciastek.")
+    return cookies
+
+
+def decode_maybe_compressed(content: bytes, enc_header: str) -> bytes:
+    """
+    Zwraca zdekodowane bajty, jeśli serwer skompresował odpowiedź.
+    Obsługuje gzip i br (brotli). W przeciwnym razie zwraca content bez zmian.
+    """
+    if not content:
+        return content
+    enc_header = (enc_header or "").lower()
+    try:
+        if "gzip" in enc_header:
+            return gzip.decompress(content)
+        if "br" in enc_header or "brotli" in enc_header:
+            return brotli.decompress(content)
+    except Exception:
+        # jak się nie uda – trudno, oddaj surowe
+        pass
+    return content
+
+
+# -------------------- GŁÓWNY PRZEPŁYW --------------------
+
+
+def main() -> None:
+    # Numer testu z argv
+    if len(sys.argv) <= 1:
+        die("Nie podano numeru testu. Użycie: python kibana_bsearch.py <test_number>")
+
+    test_number = str(sys.argv[1]).strip()
+    logs_dir = os.path.join(PROJECT_ROOT, "logs", test_number)
+    ensure_dir(logs_dir)
+
+    payload_path = os.path.join(logs_dir, PAYLOAD_FILENAME)
+    output_json_path = os.path.join(logs_dir, OUTPUT_JSON_FILENAME)
+    output_raw_path = os.path.join(logs_dir, OUTPUT_RAW_FILENAME)
+
+    print(f"🗂  PROJECT_ROOT: {PROJECT_ROOT}")
+    print(f"📝 PAYLOAD_PATH: {payload_path}")
+    print(f"📤 RESPONSE_JSON: {output_json_path}")
+    print(f"📄 RESPONSE_RAW:  {output_raw_path}")
+
+    # 1) Cookies
+    cookies = load_cookies()
+    if not cookies or not have_required_cookies(cookies):
+        cookies = maybe_get_cookies_via_helper()
+
+    # 2) Payload
+    try:
+        data = load_json(payload_path)
+    except Exception as e:
+        die(f"Nie udało się wczytać payloadu z {payload_path}: {e}")
+
+    # 3) Request
+    print(f"🌐 POST {KIBANA_URL}")
+    try:
+        resp = requests.post(
+            KIBANA_URL,
+            headers=DEFAULT_HEADERS,
+            cookies=cookies,
+            json=data,
+            timeout=60,
+            verify=False,  # kibana bywa na self-signed; jeśli masz cert, ustaw True
+        )
+    except Exception as e:
+        die(f"Błąd podczas wywołania requestu: {e}")
+
+    print(f"Status: {resp.status_code}")
+
+    # 4) Spróbuj ładnie jako JSON
+    try:
+        parsed = resp.json()
+        # krótki podgląd
+        preview = json.dumps(parsed, ensure_ascii=False)[:1000]
+        print("📦 Odpowiedź JSON (pierwsze 1000 znaków):")
+        print(preview)
+        dump_pretty_json(output_json_path, parsed)
+        print(f"✅ Zapisano odpowiedź jako {output_json_path}")
+        sys.exit(0)
+    except json.JSONDecodeError:
+        print("⚠️  Nie wygląda na JSON. Próbuję zdekompresować i zapisać surową odpowiedź…")
+    except Exception as e:
+        print(f"⚠️  Nie udało się sparsować odpowiedzi jako JSON: {e}")
+
+    # 5) Surowa odpowiedź (z ewentualną dekompresją)
+    try:
+        enc = resp.headers.get("Content-Encoding", "")
+        decoded = decode_maybe_compressed(resp.content, enc)
+        with open(output_raw_path, "wb") as f:
+            f.write(decoded if decoded is not None else resp.content)
+        print(f"📝 Zapisano surową odpowiedź do {output_raw_path}")
+    except Exception as e:
+        print(f"⚠️  Nie udało się zapisać surowej odpowiedzi: {e}")
+
+    # zgodnie z Twoją notką: nie ponawiamy logowania; kończymy bez błędu
+    print("⛔ Nie uruchamiam ponownie logowania.")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+q
