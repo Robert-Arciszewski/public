@@ -1,0 +1,246 @@
+import os
+import sys
+import json
+import gzip
+import brotli
+import subprocess
+import urllib3
+import requests
+from typing import Dict, Any, Optional
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# -------------------- KONFIG --------------------
+
+KIBANA_URL = os.environ.get(
+    "KIBANA_URL",
+    "https://twoja-kibana.example.com/internal/bsearch?compress=true",
+)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR))
+
+COOKIES_PATH = os.environ.get("COOKIES_PATH", os.path.join(BASE_DIR, "cookies.json"))
+GET_COOKIE_SCRIPT = os.environ.get(
+    "GET_COOKIE_SCRIPT", os.path.join(BASE_DIR, "kibana_get_cookie.py")
+)
+
+PAYLOAD_FILENAME = os.environ.get("PAYLOAD_FILENAME", "payload.json")
+OUTPUT_JSON_FILENAME = "response.json"
+OUTPUT_RAW_FILENAME = "response_raw.txt"
+
+# ✅ WYMAGANE ciasteczka (u Ciebie AUTHP jest poprawne)
+COOKIE_KEYS_REQUIRED = ["AUTHP_SESSION_ID", "access_token"]
+
+# Dopuszczalne aliasy nazw (gdyby ktoś eksportował inaczej)
+COOKIE_ALIASES = {
+    "AUTH0_SESSION_ID": "AUTHP_SESSION_ID",
+    "AuthSessionId": "AUTHP_SESSION_ID",
+}
+
+REQUESTS_VERIFY = os.environ.get("REQUESTS_VERIFY", "true").lower() != "false"
+
+DEFAULT_HEADERS = {
+    "accept": "*/*",
+    "accept-language": "pl,en;q=0.9",
+    "content-type": "application/json",
+    "kbn-xsrf": "true",
+    "origin": "https://twoja-kibana.example.com",
+    "referer": "https://twoja-kibana.example.com/app/discover",
+    "user-agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+    ),
+}
+
+# -------------------- UTIL --------------------
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"❌ {msg}")
+    sys.exit(code)
+
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def load_json(path: str) -> Any:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def dump_pretty_json(path: str, obj: Any) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def make_session_with_retry() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["POST", "GET"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+def load_cookies() -> Optional[Dict[str, str]]:
+    """Wczytuje cookies z COOKIES_PATH. Obsługuje listę {name,value} lub dict."""
+    try:
+        raw = load_json(COOKIES_PATH)
+    except Exception as e:
+        print(f"⚠️  Nie udało się wczytać {COOKIES_PATH}: {e}")
+        return None
+
+    cookies: Dict[str, str] = {}
+    if isinstance(raw, list):
+        for c in raw:
+            name = c.get("name")
+            value = c.get("value")
+            if name and value is not None:
+                cookies[name] = str(value)
+    elif isinstance(raw, dict):
+        cookies = {k: str(v) for k, v in raw.items()}
+
+    # aliasy -> standaryzuj do AUTHP_SESSION_ID
+    for src, dst in COOKIE_ALIASES.items():
+        if src in cookies and dst not in cookies:
+            cookies[dst] = cookies[src]
+
+    print("🍪 Cookies dostępne:", ", ".join(sorted(cookies.keys())))
+    return cookies or None
+
+
+def have_required_cookies(cookies: Dict[str, str]) -> bool:
+    missing = [k for k in COOKIE_KEYS_REQUIRED if not cookies.get(k)]
+    if missing:
+        print("🚫 Brakuje ciastek:", ", ".join(missing))
+        return False
+    return True
+
+
+def maybe_get_cookies_via_helper() -> Dict[str, str]:
+    print("ℹ️  Brakuje wymaganych ciastek — uruchamiam helper do pobrania cookies…")
+    try:
+        subprocess.run([sys.executable, GET_COOKIE_SCRIPT], check=True)
+    except FileNotFoundError:
+        die(f"Brak skryptu pomocniczego: {GET_COOKIE_SCRIPT}")
+    except subprocess.CalledProcessError as e:
+        die(f"Skrypt pomocniczy zakończył się błędem: {e}")
+
+    cookies = load_cookies()
+    if not cookies or not have_required_cookies(cookies):
+        die("Nadal brakuje wymaganych ciastek po uruchomieniu helpera.")
+    print("✅ Używam świeżo pobranych ciastek.")
+    return cookies
+
+
+def decode_maybe_compressed(content: bytes, enc_header: str) -> bytes:
+    enc = (enc_header or "").lower()
+    if not content:
+        return content
+    try:
+        if "gzip" in enc:
+            return gzip.decompress(content)
+        if "br" in enc or "brotli" in enc:
+            return brotli.decompress(content)
+    except Exception:
+        pass
+    return content
+
+
+# -------------------- MAIN --------------------
+
+
+def main() -> None:
+    if len(sys.argv) <= 1:
+        die("Użycie: python kibana_bsearch.py <test_number>")
+
+    test_number = str(sys.argv[1]).strip()
+    logs_dir = os.path.join(PROJECT_ROOT, "logs", test_number)
+    ensure_dir(logs_dir)
+
+    payload_path = os.path.join(logs_dir, PAYLOAD_FILENAME)
+    output_json_path = os.path.join(logs_dir, OUTPUT_JSON_FILENAME)
+    output_raw_path = os.path.join(logs_dir, OUTPUT_RAW_FILENAME)
+
+    print(f"🗂  PROJECT_ROOT: {PROJECT_ROOT}")
+    print(f"📝 PAYLOAD_PATH: {payload_path}")
+    print(f"📤 RESPONSE_JSON: {output_json_path}")
+    print(f"📄 RESPONSE_RAW:  {output_raw_path}")
+
+    # 1) Cookies
+    cookies = load_cookies()
+    if not cookies or not have_required_cookies(cookies):
+        cookies = maybe_get_cookies_via_helper()
+
+    # 2) Payload
+    try:
+        data = load_json(payload_path)
+    except Exception as e:
+        die(f"Nie udało się wczytać payloadu ({payload_path}): {e}")
+
+    # 3) Sesja z retry
+    session = make_session_with_retry()
+    headers = dict(DEFAULT_HEADERS)
+
+    # Opcjonalny Authorization: Bearer z access_token (często pomaga)
+    access_token = cookies.get("access_token")
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+
+    # 4) Request
+    print(f"🌐 POST {KIBANA_URL}  (verify={REQUESTS_VERIFY})")
+    try:
+        resp = session.post(
+            KIBANA_URL,
+            headers=headers,
+            cookies=cookies,   # Kibana zwykle akceptuje oba: cookie + Bearer
+            json=data,
+            timeout=60,
+            verify=REQUESTS_VERIFY,
+            stream=False,
+        )
+    except Exception as e:
+        die(f"Błąd requestu: {e}")
+
+    print(f"Status: {resp.status_code}")
+
+    # 5) Spróbuj JSON
+    try:
+        parsed = resp.json()
+        preview = json.dumps(parsed, ensure_ascii=False)[:1000]
+        print("📦 Odpowiedź JSON (pierwsze 1000 znaków):")
+        print(preview)
+        dump_pretty_json(output_json_path, parsed)
+        print(f"✅ Zapisano JSON -> {output_json_path}")
+        sys.exit(0)
+    except json.JSONDecodeError:
+        print("⚠️  Nie wygląda na JSON — zapisuję surową odpowiedź (spróbuję zdekompresować).")
+    except Exception as e:
+        print(f"⚠️  Błąd przy parsowaniu JSON: {e}")
+
+    # 6) Surowa odpowiedź (z dekompresją)
+    try:
+        enc = resp.headers.get("Content-Encoding", "")
+        decoded = decode_maybe_compressed(resp.content, enc) or resp.content
+        with open(output_raw_path, "wb") as f:
+            f.write(decoded)
+        print(f"📝 Zapisano surową odpowiedź -> {output_raw_path}")
+    except Exception as e:
+        print(f"⚠️  Nie udało się zapisać surowej odpowiedzi: {e}")
+
+    print("⛔ Nie uruchamiam ponownie logowania. Koniec.")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
